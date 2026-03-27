@@ -1,0 +1,76 @@
+{
+  "name": "Marie Tremblay",
+  "age": 38,
+  "birthday": "1987-06-14",
+  "phone": "514-555-0192",
+  "email": "marie.tremblay@email.com",
+  "assets": {
+    "core_banking": [
+      {
+        "account_number": "1234567",
+        "transit_number": "00612",
+        "type": "everyday_chequing",
+        "balance": 1240.00
+      },
+      {
+        "account_number": "1234568",
+        "transit_number": "00612",
+        "type": "everyday_savings",
+        "balance": 4210.00
+      }
+    ],
+    "investments": [
+      {
+        "account_number": "INV-00421",
+        "type": "GIC",
+        "wrapper": "TFSA",
+        "start_date": "2023-03-01",
+        "principal": 10000.00,
+        "current_value": 10412.50,
+        "details": {
+          "maturity_date": "2026-03-01",
+          "interest_rate": 4.15
+        }
+      },
+      {
+        "account_number": "INV-00422",
+        "type": "MUTUAL_FUND",
+        "wrapper": "RRSP",
+        "start_date": "2020-01-15",
+        "principal": 25000.00,
+        "current_value": 31200.00,
+        "details": {
+          "mer": 1.85,
+          "units": 412.3,
+          "nav": 75.68
+        }
+      }
+    ]
+  },
+  "liabilities": [
+    {
+      "account_number": "LIB-00881",
+      "type": "VISA",
+      "balance": 1850.00,
+      "credit_limit": 10000,
+      "interest_rate": 19.99
+    },
+    {
+      "account_number": "LIB-00882",
+      "type": "MORTGAGE",
+      "balance": 284000.00,
+      "credit_limit": 320000,
+      "interest_rate": 5.14,
+      "details": {
+        "renewal_date": "2026-11-01"
+      }
+    }
+  ],
+  "preapprovals": [
+    {
+      "product": "LOC",
+      "credit_limit": 25000,
+      "expiry_date": "2026-06-30"
+    }
+  ]
+}
