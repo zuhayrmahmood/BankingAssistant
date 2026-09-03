@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 
+from rag import HybridRetriever, format_context
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class AccountType(str, Enum):
@@ -146,6 +148,73 @@ class ClientProfile:
         return " | ".join(parts)
 
 
+# ── Opportunity analysis (drives retrieval) ───────────────────────────────────
+
+# Which product families a client already holds map into these retrieval
+# categories; gaps map to the families we want the teller to explore.
+_CHEQUING_TYPES = {
+    AccountType.MINIMUM_CHEQUING, AccountType.EVERYDAY_CHEQUING,
+    AccountType.UNLIMITED_CHEQUING, AccountType.ALL_INCLUSIVE_CHEQUING,
+}
+_SAVINGS_TYPES = {AccountType.EVERYDAY_SAVINGS, AccountType.HIGH_INTEREST_TFSA, AccountType.EPREMIUM}
+_REGISTERED_WRAPPERS = {InvestmentWrapper.TFSA, InvestmentWrapper.RRSP, InvestmentWrapper.FHSA}
+
+# Only flag idle cash for an investment conversation once deposit balances reach
+# roughly this level — small everyday balances are not an investment opportunity.
+IDLE_CASH_THRESHOLD = 20_000
+
+
+def analyze_opportunities(client: "ClientProfile") -> tuple[list[str], list[str]]:
+    """Return (human-readable opportunity notes, retrieval category filter).
+
+    Deterministic, profile-driven signal that (a) tells the LLM what to focus on
+    and (b) restricts retrieval to the relevant product families — the metadata
+    pre-filter that keeps hybrid search focused.
+    """
+    notes: list[str] = []
+    categories: set[str] = set()
+
+    account_types = {a.type for a in client.accounts}
+    wrappers = {i.wrapper for i in client.investments}
+    liability_types = {l.type for l in client.liabilities}
+
+    # Gaps in standard products.
+    if not (account_types & _CHEQUING_TYPES):
+        notes.append("No chequing account on file — core banking / primacy opportunity.")
+        categories.add("core_banking")
+    if not (account_types & _SAVINGS_TYPES):
+        notes.append("No savings account on file — savings opportunity.")
+        categories.add("core_banking")
+    if not (wrappers & _REGISTERED_WRAPPERS):
+        notes.append("No registered investment (TFSA/RRSP/FHSA) — investment opportunity.")
+        categories.add("investments")
+    if LiabilityType.VISA not in liability_types:
+        notes.append("No credit card on file — credit product opportunity.")
+        categories.add("credit_cards")
+
+    # Cross-sell signals on existing holdings.
+    idle_cash = sum(a.balance for a in client.accounts)
+    if idle_cash >= IDLE_CASH_THRESHOLD:
+        notes.append(f"~${idle_cash:,.0f} idle cash in deposit accounts — investment conversation.")
+        categories.add("investments")
+    if any(l.type == LiabilityType.VISA for l in client.liabilities):
+        notes.append("Holds a credit card — backup/travel card or limit conversation possible.")
+        categories.add("credit_cards")
+    if any(l.type in (LiabilityType.MORTGAGE, LiabilityType.HELOC) for l in client.liabilities):
+        categories.add("mortgages")
+
+    # If nothing flagged, let retrieval range over the whole corpus.
+    return notes, sorted(categories)
+
+
+def build_retrieval_query(client: "ClientProfile", notes: list[str]) -> str:
+    """Compose the natural-language retrieval query from profile + opportunities."""
+    parts = [client.to_prompt_string()]
+    if notes:
+        parts.append("Opportunities to explore: " + " ".join(notes))
+    return " ".join(parts)
+
+
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 
 def _parse_date(s: str) -> date:
@@ -251,21 +320,56 @@ def load_client(path: str) -> ClientProfile:
 class GenerateConversationPrompts(dspy.Signature):
     """
     You are a senior bank relationship manager coaching a teller.
-    Given a client's profile, generate open-ended questions the teller can
-    ask naturally during the interaction to uncover needs and create value.
-    Focus on life events, goals, and pain points — not product pitching.
-    Questions must feel warm, genuine, and conversational.
+    Given a client's profile and a list of concrete opportunities, generate
+    DIRECT questions the teller can ask — each one names something specific you
+    observe about this client's holdings (or gaps) and creates a reason for
+    them to grow their business with the bank.
 
-    Value is generated through increasing a customer's business with the bank. Business is increase when
-    a customer opens a new account, makes investments either through a financial planner (over $100k total balance)
-    or a personal banker (under $100k), and, opens up new credit cards.
+    Every question MUST:
+      • Lead with a specific observation about THIS client — reference the real
+        product they hold or the gap they have, by name (their one credit card,
+        their idle cash, their missing savings account, a maturing GIC, an
+        unused pre-approval, an upcoming mortgage renewal).
+      • Follow with a pointed question that surfaces a need or risk they haven't
+        acted on (fraud exposure with a single card, cash that isn't earning,
+        a missing core product, a pre-approval about to expire).
+      • Stay warm and conversational — direct is not pushy — but do NOT fall
+        back on generic "what are your financial goals?" phrasing.
 
-    If a client has multiple credit cards, you can frame the question around having a smaller credit limit card
-    in case of fraud and having a backup for travelling. If a client is missing a standard product (chequing account,
-    saving account, tfsa/rrsp/fhsa) then ask an open-ended question surrounding those.
+    Value is generated by increasing the customer's business: opening a new
+    account, moving idle cash into investments (a financial planner if total
+    balance is over $100k, a personal banker if under), opening a new credit
+    card, or gaining primacy (getting direct deposit into a chequing account).
+
+    Be this direct:
+      • Missing a savings account →
+        "I see you don't have a savings account with us — where are you keeping
+         the money you set aside right now?"
+      • Holds only one credit card →
+        "Looks like you've got just the one card — is that the one you use
+         everywhere? If it ever got compromised you'd be left without a backup.
+         Worth looking at a second card for travel or fraud protection?"
+      • An unused pre-approval →
+        "You're actually pre-approved for a line of credit — want me to get
+         that set up while it's available?"
+
+    Raise idle cash / "put your money to work" ONLY when an idle-cash line
+    appears in the opportunities list — never for a small everyday balance.
+    Do not invent opportunities that are not in the opportunities list or
+    clearly supported by the profile (e.g. don't claim a client has no
+    investments when their profile lists some).
+
+    Ground every product reference in the retrieved product context — do not
+    invent rates, fees, or terms.
     """
     client_profile: str = dspy.InputField(
         desc="Client context: name, age, accounts, investments, liabilities, pre-approvals")
+    opportunities: str = dspy.InputField(
+        desc="Concrete, profile-derived opportunities and gaps for this client. "
+             "Anchor each question to one of these — name the specific product or gap.")
+    product_context: str = dspy.InputField(
+        desc="Retrieved product documents (rates, fees, eligibility, fit). "
+             "Ground every product reference in these — do not invent rates or terms.")
     num_questions: int = dspy.InputField(desc="Number of questions to generate")
     conversation_prompts: str = dspy.OutputField(
         desc="Numbered list of open-ended questions. Each on its own line. "
@@ -276,12 +380,15 @@ class GenerateConversationPrompts(dspy.Signature):
 class RankAndRefinePrompts(dspy.Signature):
     """
     Review a set of conversation prompts and select the top ones most likely
-    to naturally lead to sales units for the bank. Rewrite them to
-    sound more natural and empathetic if needed.
+    to lead to new business for the bank. Keep them DIRECT and specific — each
+    should name what you observe about the client and give a concrete reason to
+    act. Tighten the wording so it sounds natural and empathetic, but never
+    soften a pointed, observation-led question back into a generic one.
 
-    The bank gets sales through: opening up new accounts, making investments using large sums of idle cash,
-    opening up new credit cards and gaining primacy (set up direct deposit into the account). Make sure to
-    ask questions that help the bank while being natural and empathetic.
+    The bank gets new business through: opening new accounts, moving large sums
+    of idle cash into investments, opening new credit cards, and gaining primacy
+    (direct deposit into the account). Favour questions that make one of these
+    the obvious next step for the client.
     """
     raw_prompts: str = dspy.InputField(desc="Initial list of conversation prompts")
     client_context: str = dspy.InputField(desc="Client profile summary")
@@ -294,17 +401,47 @@ class RankAndRefinePrompts(dspy.Signature):
 # ── DSPy Module ───────────────────────────────────────────────────────────────
 
 class BankingAssistantModule(dspy.Module):
-    def __init__(self):
+    def __init__(self, retriever: Optional[HybridRetriever] = None, top_n: int = 4):
         super().__init__()
         self.generate = dspy.ChainOfThought(GenerateConversationPrompts)
         self.refine = dspy.ChainOfThought(RankAndRefinePrompts)
+        self.retriever = retriever
+        self.top_n = top_n
 
-    def forward(self, client_profile: str, num_questions: int = 5):
-        gen = self.generate(client_profile=client_profile, num_questions=num_questions)
-        refined = self.refine(raw_prompts=gen.conversation_prompts, client_context=client_profile)
+    def forward(self, client: "ClientProfile", num_questions: int = 5):
+        profile_str = client.to_prompt_string()
+
+        # Deterministic opportunity analysis drives BOTH retrieval steering and
+        # the generation prompt, so questions can name the specific gap/holding.
+        notes, categories = analyze_opportunities(client)
+        opportunities = (
+            "\n".join(f"- {n}" for n in notes)
+            if notes
+            else "(no standout gaps flagged; explore primacy, idle cash, and growth)"
+        )
+
+        # Retrieval: filter categories → hybrid + rerank.
+        product_context = "(retrieval disabled)"
+        retrieved = []
+        if self.retriever is not None:
+            query = build_retrieval_query(client, notes)
+            retrieved = self.retriever.retrieve(
+                query, categories=categories or None, top_n=self.top_n
+            )
+            product_context = format_context(retrieved)
+
+        gen = self.generate(
+            client_profile=profile_str,
+            opportunities=opportunities,
+            product_context=product_context,
+            num_questions=num_questions,
+        )
+        refined = self.refine(raw_prompts=gen.conversation_prompts, client_context=profile_str)
         return dspy.Prediction(
             raw_prompts=gen.conversation_prompts,
             refined_prompts=refined.refined_prompts,
+            product_context=product_context,
+            retrieved=retrieved,
         )
 
 
